@@ -1710,7 +1710,8 @@ class LlamaTwoStreamAttention(LlamaSdpaAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,  # 用于K/V
-        attention_mask: Optional[torch.LongTensor] = None,
+        attention_mask_query: Optional[torch.LongTensor] = None,
+        attention_mask_content: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
@@ -1722,31 +1723,33 @@ class LlamaTwoStreamAttention(LlamaSdpaAttention):
     ) -> tuple:
         bsz, q_len, _ = hidden_states.size() if query_states is None else query_states.size()
         # Q
-        if query_states is not None:
-            q_proj_input = query_states
-        else:
-            q_proj_input = hidden_states
-        query_states_proj = self.q_proj(q_proj_input)
+        q_proj_input_query = query_states
+        q_proj_input_content = hidden_states
+        query_states_proj_query = self.q_proj(q_proj_input_query)
+        query_states_proj_content = self.q_proj(q_proj_input_content)
         key_states_proj = self.k_proj(hidden_states)
         value_states_proj = self.v_proj(hidden_states)
 
-        query_states_proj = query_states_proj.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states_proj_query = query_states_proj_query.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states_proj_content = query_states_proj_content.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states_proj = key_states_proj.view(bsz, hidden_states.shape[1], self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states_proj = value_states_proj.view(bsz, hidden_states.shape[1], self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = self.rotary_emb(value_states_proj, position_ids)
-        query_states_proj, key_states_proj = apply_rotary_pos_emb(query_states_proj, key_states_proj, cos, sin)
+        query_states_proj_query, _ = apply_rotary_pos_emb(query_states_proj_query, key_states_proj, cos, sin)
+        query_states_proj_content, key_states_proj = apply_rotary_pos_emb(query_states_proj_content, key_states_proj, cos, sin)
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states_proj, value_states_proj = past_key_value.update(key_states_proj, value_states_proj, self.layer_idx, cache_kwargs)
 
-        query_states_proj = query_states_proj.transpose(1, 2)
+        query_states_proj_query = query_states_proj_query.transpose(1, 2)
+        query_states_proj_content = query_states_proj_content.transpose(1, 2)
         key_states_proj = key_states_proj.transpose(1, 2)
         value_states_proj = value_states_proj.transpose(1, 2)
 
         dropout_rate = self.attention_dropout if self.training else 0.0
-        input_dtype = query_states_proj.dtype
+        input_dtype = query_states_proj_query.dtype
         if input_dtype == torch.float32:
             if torch.is_autocast_enabled():
                 target_dtype = torch.get_autocast_gpu_dtype()
@@ -1754,40 +1757,58 @@ class LlamaTwoStreamAttention(LlamaSdpaAttention):
                 target_dtype = self.config._pre_quantization_dtype
             else:
                 target_dtype = self.q_proj.weight.dtype
-            query_states_proj = query_states_proj.to(target_dtype)
+            query_states_proj_query = query_states_proj_query.to(target_dtype)
+            query_states_proj_content = query_states_proj_content.to(target_dtype)
             key_states_proj = key_states_proj.to(target_dtype)
             value_states_proj = value_states_proj.to(target_dtype)
+        
+        def attention_mask_process(attention_mask):
+            attention_mask = self._process_attention_masks(
+                attention_mask, perm_mask, target_mapping, q_len
+            )
 
-        attention_mask = self._process_attention_masks(
-            attention_mask, perm_mask, target_mapping, q_len
-        )
+            # SDPA path with explicit additive attention mask
+            # Ensure mask shape is (batch, 1 or heads, q_len, k_len)
+            if attention_mask is not None:
+                if attention_mask.dim() == 3:
+                    # (batch, q_len, k_len) -> (batch, 1, q_len, k_len)
+                    attention_mask = attention_mask.unsqueeze(1)
+                elif attention_mask.dim() == 2:
+                    # (batch, seq_len) padding mask -> convert to additive mask
+                    # 1 -> keep (0.0), 0 -> mask (-inf)
+                    padding = (attention_mask == 0).to(query_states_proj_query.dtype)
+                    attention_mask = padding[:, None, :, None] * torch.finfo(query_states_proj_query.dtype).min
+                attention_mask = attention_mask.to(dtype=query_states_proj_query.dtype)
+            return attention_mask
+        
+        attention_mask_query = attention_mask_process(attention_mask_query)
+        attention_mask_content = attention_mask_process(attention_mask_content)
 
-        # SDPA path with explicit additive attention mask
-        # Ensure mask shape is (batch, 1 or heads, q_len, k_len)
-        if attention_mask is not None:
-            if attention_mask.dim() == 3:
-                # (batch, q_len, k_len) -> (batch, 1, q_len, k_len)
-                attention_mask = attention_mask.unsqueeze(1)
-            elif attention_mask.dim() == 2:
-                # (batch, seq_len) padding mask -> convert to additive mask
-                # 1 -> keep (0.0), 0 -> mask (-inf)
-                padding = (attention_mask == 0).to(query_states_proj.dtype)
-                attention_mask = padding[:, None, :, None] * torch.finfo(query_states_proj.dtype).min
-            attention_mask = attention_mask.to(dtype=query_states_proj.dtype)
-
-        attn_output = F.scaled_dot_product_attention(
-            query_states_proj,
+        attn_output_query = F.scaled_dot_product_attention(
+            query_states_proj_query,
             key_states_proj,
             value_states_proj,
-            attn_mask=attention_mask,
+            attn_mask=attention_mask_query,
             dropout_p=dropout_rate,
             is_causal=False,
         )
         # (batch, heads, q_len, head_dim) -> (batch, q_len, hidden)
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
-        attn_output = self.o_proj(attn_output)
+        attn_output_query = attn_output_query.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
+        attn_output_query = self.o_proj(attn_output_query)
+
+        attn_output_content = F.scaled_dot_product_attention(
+            query_states_proj_content,
+            key_states_proj,
+            value_states_proj,
+            attn_mask=attention_mask_content,
+            dropout_p=dropout_rate,
+            is_causal=False,
+        )
+        attn_output_content = attn_output_content.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
+        attn_output_content = self.o_proj(attn_output_content)
+
         attn_weights = None
-        return attn_output, attn_weights, past_key_value
+        return attn_output_query, attn_output_content, attn_weights, past_key_value
 
     def _process_attention_masks(
         self, 
@@ -1849,22 +1870,6 @@ class LlamaTwoStreamDecoderLayer(nn.Module):
         
         # For content stream, use perm_mask (can see groups <= current group)
         content_attn_mask = perm_mask if perm_mask is not None else attention_mask
-        
-        content_output, content_attn_weights, content_present_key_value = self.attn(
-            hidden_states=content_input,
-            attention_mask=content_attn_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            target_mapping=target_mapping,
-            perm_mask=perm_mask,
-            query_states=None,
-        )
-        content_output = content_states + content_output
-        content_output = self.post_attention_layernorm(content_output)
-        content_output = content_output + self.mlp(content_output)
 
         # Query Stream: Q用query_states，K/V用content_states
         query_input = self.input_layernorm(query_states)
@@ -1872,9 +1877,10 @@ class LlamaTwoStreamDecoderLayer(nn.Module):
         # Use precomputed query_mask when provided
         query_attn_mask = query_mask if query_mask is not None else attention_mask
         
-        query_output, query_attn_weights, query_present_key_value = self.attn(
-            hidden_states=content_input,  # K/V用content_input
-            attention_mask=query_attn_mask,
+        query_output, content_output, content_attn_weights, content_present_key_value = self.attn(
+            hidden_states=content_input,
+            attention_mask_query=query_attn_mask,
+            attention_mask_content=content_attn_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
@@ -1882,8 +1888,13 @@ class LlamaTwoStreamDecoderLayer(nn.Module):
             cache_position=cache_position,
             target_mapping=target_mapping,
             perm_mask=perm_mask,
-            query_states=query_input,    # Q用query_input
+            query_states=query_input,
         )
+
+        content_output = content_states + content_output
+        content_output = self.post_attention_layernorm(content_output)
+        content_output = content_output + self.mlp(content_output)
+
         query_output = query_states + query_output
         query_output = self.post_attention_layernorm(query_output)
         query_output = query_output + self.mlp(query_output)
@@ -2100,9 +2111,9 @@ class LlamaTwoStreamModel(LlamaPreTrainedModel):
         
         # 返回包含两个流的输出
         return BaseModelOutputWithPast(
-            last_hidden_state=content_states,  # 主要输出content stream
+            last_hidden_state=query_states,  # 主要输出content stream
             past_key_values=next_cache,
-            hidden_states=all_content_hidden_states,
+            hidden_states=all_query_hidden_states,
             attentions=all_self_attns,
         )
     
