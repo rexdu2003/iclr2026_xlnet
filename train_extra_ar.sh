@@ -8,7 +8,7 @@ deepspeed --num_gpus=8 train.py \
 --num_train_epochs 1 \
 --bf16 \
 --max_steps 0 \
---grouping_strategy 4 \
+--grouping_strategy 2 \
 --deepspeed_config ds_config.json \
 --wandb_project llama_xlnet \
 --wandb_run_name extra_train
