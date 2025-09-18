@@ -1,0 +1,14 @@
+deepspeed --num_gpus=8 train.py \
+--dataset_name /prodcpfs/user/tianqi/dataset/fineweb/HuggingFaceFW___fineweb/sample-10BT/0.0.0/9bb295ddab0e05d785b879661af7260fed5140fc \
+--model_name_or_path /prodcpfs/user/tianqi/models/two_stream_fineweb_checkpoint_stage4.0plus \
+--output_dir /prodcpfs/user/tianqi/models/two_stream_fineweb_checkpoint_stage4.0plus2/ \
+--per_device_train_batch_size 1 \
+--gradient_accumulation_steps 8 \
+--max_seq_length 2048 \
+--num_train_epochs 1 \
+--bf16 \
+--max_steps 0 \
+--grouping_strategy 4 \
+--deepspeed_config ds_config.json \
+--wandb_project llama_xlnet \
+--wandb_run_name extra_train
