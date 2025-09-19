@@ -37,6 +37,7 @@ from transformers.modeling_outputs import (
     TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import (
     add_start_docstrings,
@@ -173,29 +174,84 @@ class LlamaRMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
 
 
 class LlamaRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+    def __init__(
+        self,
+        dim=None,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+        rope_type="default",
+        config: Optional[LlamaConfig] = None,
+    ):
         super().__init__()
-        self.scaling_factor = scaling_factor
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
+        # TODO (joao): remove the `if` below, only used for BC
+        self.rope_kwargs = {}
+        if config is None:
+            logger.warning_once(
+                "`LlamaRotaryEmbedding` can now be fully parameterized by passing the model config through the "
+                "`config` argument. All other arguments will be removed in v4.46"
+            )
+            self.rope_kwargs = {
+                "rope_type": rope_type,
+                "factor": scaling_factor,
+                "dim": dim,
+                "base": base,
+                "max_position_embeddings": max_position_embeddings,
+            }
+            self.rope_type = rope_type
+            self.max_seq_len_cached = max_position_embeddings
+            self.original_max_seq_len = max_position_embeddings
+        else:
+            # BC: "rope_type" was originally "type"
+            if config.rope_scaling is not None:
+                self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+            else:
+                self.rope_type = "default"
+            self.max_seq_len_cached = config.max_position_embeddings
+            self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, **self.rope_kwargs)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        # For BC we register cos and sin cached
-        self.max_seq_len_cached = max_position_embeddings
+        self.original_inv_freq = self.inv_freq
+
+    def _dynamic_frequency_update(self, position_ids, device):
+        """
+        dynamic RoPE layers should recompute `inv_freq` in the following situations:
+        1 - growing beyond the cached sequence length (allow scaling)
+        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        """
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:  # growth
+            inv_freq, self.attention_scaling = self.rope_init_fn(
+                self.config, device, seq_len=seq_len, **self.rope_kwargs
+            )
+            self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: may break with compilation
+            self.max_seq_len_cached = seq_len
+
+        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:  # reset
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
 
     @torch.no_grad()
     def forward(self, x, position_ids):
-        # x: [bs, num_attention_heads, seq_len, head_size]
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+
+        # Core RoPE block
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
-        # Force float32 since bfloat16 loses precision on long contexts
-        # See https://github.com/huggingface/transformers/pull/29285
+        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
@@ -203,36 +259,37 @@ class LlamaRotaryEmbedding(nn.Module):
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
             sin = emb.sin()
+
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """LlamaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
 
-    def forward(self, x, position_ids):
-        # difference to the original RoPE: a scaling factor is aplied to the position ids
-        position_ids = position_ids.float() / self.scaling_factor
-        cos, sin = super().forward(x, position_ids)
-        return cos, sin
+    def __init__(self, *args, **kwargs):
+        logger.warning_once(
+            "`LlamaLinearScalingRotaryEmbedding` is deprecated an will be removed in v4.46. Please use "
+            "`LlamaRotaryEmbedding`, which now also does linear scaling (simply pass the model config to __init__)."
+        )
+        kwargs["rope_type"] = "linear"
+        super().__init__(*args, **kwargs)
 
 
 class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """LlamaRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
 
-    def forward(self, x, position_ids):
-        # difference to the original RoPE: inv_freq is recomputed when the sequence length > original length
-        seq_len = torch.max(position_ids) + 1
-        if seq_len > self.max_position_embeddings:
-            base = self.base * (
-                (self.scaling_factor * seq_len / self.max_position_embeddings) - (self.scaling_factor - 1)
-            ) ** (self.dim / (self.dim - 2))
-            inv_freq = 1.0 / (
-                base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim)
-            )
-            self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: this may break with compilation
-
-        cos, sin = super().forward(x, position_ids)
-        return cos, sin
+    def __init__(self, *args, **kwargs):
+        logger.warning_once(
+            "`LlamaDynamicNTKScalingRotaryEmbedding` is deprecated an will be removed in v4.46. Please use "
+            "`LlamaRotaryEmbedding`, which now also does dynamic ntk scaling (simply pass the model config to "
+            "__init__)."
+        )
+        kwargs["rope_type"] = "dynamic"
+        super().__init__(*args, **kwargs)
 
 
 def rotate_half(x):
@@ -267,6 +324,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
 
 
 class LlamaMLP(nn.Module):
@@ -349,7 +407,8 @@ class LlamaAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
-        self._init_rope()
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        #self._init_rope()
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -1734,6 +1793,9 @@ class LlamaTwoStreamAttention(LlamaSdpaAttention):
         query_states_proj_content = query_states_proj_content.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states_proj = key_states_proj.view(bsz, hidden_states.shape[1], self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states_proj = value_states_proj.view(bsz, hidden_states.shape[1], self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        
+        
+        # print(query_states_proj_query.shape, key_states_proj.shape)
 
         cos, sin = self.rotary_emb(value_states_proj, position_ids)
         query_states_proj_query, _ = apply_rotary_pos_emb(query_states_proj_query, key_states_proj, cos, sin)
@@ -1742,11 +1804,14 @@ class LlamaTwoStreamAttention(LlamaSdpaAttention):
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states_proj, value_states_proj = past_key_value.update(key_states_proj, value_states_proj, self.layer_idx, cache_kwargs)
+            
+        key_states_proj = repeat_kv(key_states_proj, self.num_key_value_groups)
+        value_states_proj = repeat_kv(value_states_proj, self.num_key_value_groups)
 
-        query_states_proj_query = query_states_proj_query.transpose(1, 2)
-        query_states_proj_content = query_states_proj_content.transpose(1, 2)
-        key_states_proj = key_states_proj.transpose(1, 2)
-        value_states_proj = value_states_proj.transpose(1, 2)
+        # query_states_proj_query = query_states_proj_query.transpose(1, 2)
+        # query_states_proj_content = query_states_proj_content.transpose(1, 2)
+        # key_states_proj = key_states_proj.transpose(1, 2)
+        # value_states_proj = value_states_proj.transpose(1, 2)
 
         dropout_rate = self.attention_dropout if self.training else 0.0
         input_dtype = query_states_proj_query.dtype
@@ -1783,6 +1848,16 @@ class LlamaTwoStreamAttention(LlamaSdpaAttention):
         
         attention_mask_query = attention_mask_process(attention_mask_query)
         attention_mask_content = attention_mask_process(attention_mask_content)
+        
+        if query_states.device.type == "cuda":
+            query_states_proj_query = query_states_proj_query.contiguous()
+            query_states_proj_content = query_states_proj_content.contiguous()
+            key_states_proj = key_states_proj.contiguous()
+            value_states_proj = value_states_proj.contiguous()
+        
+        
+        
+        #print(query_states_proj_query.shape, key_states_proj.shape, value_states_proj.shape, attention_mask_query.shape)
 
         attn_output_query = F.scaled_dot_product_attention(
             query_states_proj_query,
@@ -1845,7 +1920,7 @@ class LlamaTwoStreamDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.attn = LlamaTwoStreamAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = LlamaTwoStreamAttention(config=config, layer_idx=layer_idx)
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1877,7 +1952,7 @@ class LlamaTwoStreamDecoderLayer(nn.Module):
         # Use precomputed query_mask when provided
         query_attn_mask = query_mask if query_mask is not None else attention_mask
         
-        query_output, content_output, content_attn_weights, content_present_key_value = self.attn(
+        query_output, content_output, content_attn_weights, content_present_key_value = self.self_attn(
             hidden_states=content_input,
             attention_mask_query=query_attn_mask,
             attention_mask_content=content_attn_mask,
@@ -2104,14 +2179,15 @@ class LlamaTwoStreamModel(LlamaPreTrainedModel):
 
         next_cache = next_decoder_cache if use_cache else None
         if return_legacy_cache:
-            next_cache = next_cache.to_legacy_cache()
+            pass #todo
+            #next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
             return tuple(v for v in [content_states, query_states, next_cache, all_content_hidden_states, all_query_hidden_states, all_self_attns] if v is not None)
         
         # 返回包含两个流的输出
         return BaseModelOutputWithPast(
-            last_hidden_state=query_states,  # 主要输出content stream
+            last_hidden_state=query_states,  # 主要输出query stream
             past_key_values=next_cache,
             hidden_states=all_query_hidden_states,
             attentions=all_self_attns,
@@ -2255,9 +2331,9 @@ class LlamaTwoStreamForCausalLM(LlamaPreTrainedModel):
 
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            # Since we are using a two-stream model, we do not need to shift.
+            shift_logits = logits[..., :, :].contiguous()
+            shift_labels = labels[..., :].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
@@ -2366,3 +2442,219 @@ class LlamaTwoStreamForCausalLM(LlamaPreTrainedModel):
                 tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
             )
         return reordered_past
+    
+    def generate_two_stream(
+        self,
+        input_ids: torch.LongTensor,
+        group_ids: torch.LongTensor,
+        max_length: int,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        do_sample: bool = True,
+        eos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        device: Optional[torch.device] = None,
+    ) -> torch.LongTensor:
+        """
+        Generate group-by-group according to `group_ids`.
+
+        Args:
+            input_ids: Tensor (batch_size, seq_len) containing initial tokens; positions not filled should be `pad_token_id`.
+            group_ids: Tensor (batch_size, seq_len) containing integer group ids. Group id 0 indicates positions that are already provided in `input_ids` and should not be generated.
+            max_length: total sequence length to generate (including provided prefix positions)
+            temperature, top_k, top_p, do_sample: sampling params
+            eos_token_id: optional eos id to stop early
+            pad_token_id: padding token id
+            device: device to run generation on
+
+        Returns:
+            generated_ids: Tensor (batch_size, max_length)
+        """
+        # Sanity
+        if device is None:
+            device = next(self.parameters()).device
+        batch_size, seq_len = input_ids.shape
+        assert group_ids.shape == (batch_size, seq_len)
+        if pad_token_id is None:
+            pad_token_id = self.config.pad_token_id
+
+        # Start with input_ids on device
+        input_ids = input_ids.to(device)
+        group_ids = group_ids.to(device)
+
+        # Prepare output buffer
+        generated = input_ids.clone()
+
+        # Track which positions are filled (either provided initially or assigned during generation)
+        is_filled = (input_ids != pad_token_id).to(device)
+
+        # Determine finished sequences (those that already contain an EOS whose left context is fully generated)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        if eos_token_id is not None:
+            for b in range(batch_size):
+                # consider only eos positions that are currently filled (so initial pads equal to eos are ignored)
+                eos_pos = ((generated[b] == eos_token_id) & is_filled[b]).nonzero(as_tuple=False)
+                if eos_pos.numel() > 0:
+                    p = int(eos_pos[0].item())
+                    # Only mark finished if eos exists and all tokens BEFORE eos are generated (is_filled)
+                    if p == 0:
+                        finished[b] = True
+                    else:
+                        if is_filled[b, :p].all():
+                            finished[b] = True
+
+        # We'll generate group by group, skipping group_id==0 positions (already provided)
+        unique_groups = torch.unique(group_ids)
+        unique_groups = unique_groups[unique_groups != 0]
+        # Sort groups ascending
+        unique_groups, _ = torch.sort(unique_groups)
+
+        for g in unique_groups.tolist():
+            # If all sequences are finished, stop
+            if finished.all():
+                break
+
+            # Build mask for positions to generate in this group
+            to_generate_mask = (group_ids == g)
+            if not to_generate_mask.any():
+                continue
+
+            # Run model to get logits for all positions
+            with torch.no_grad():
+                outputs = self(
+                    input_ids=generated,
+                    group_ids=group_ids,
+                    return_dict=True,
+                )
+                logits = outputs.logits  # (batch, seq_len, vocab)
+
+            # Sample tokens for positions in this group
+            logits = logits[:, :, :] / max(temperature, 1e-8)
+
+            # Apply top_k/top_p filtering per step if requested
+            def top_k_top_p_filtering(logits, top_k=0, top_p=1.0):
+                top_k = min(top_k, logits.size(-1))
+                if top_k > 0:
+                    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                    logits[indices_to_remove] = -float('Inf')
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                    # Remove tokens with cumulative probability above top_p
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    # Shift the indices to the right to keep first token above the threshold
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = -float('Inf')
+                return logits
+
+            filtered_logits = top_k_top_p_filtering(logits.clone(), top_k=top_k, top_p=top_p)
+
+            probs = torch.softmax(filtered_logits, dim=-1)
+
+            # Sample or take argmax only for positions in this group
+            sampled = torch.multinomial(probs.view(-1, probs.size(-1)), num_samples=1).view(batch_size, seq_len)
+
+            # Update generated tokens only where to_generate_mask is True
+            generated = generated.clone()
+            for b in range(batch_size):
+                if finished[b]:
+                    continue
+                idxs = torch.nonzero(to_generate_mask[b], as_tuple=False).flatten()
+                for idx in idxs.tolist():
+                    if do_sample:
+                        token = sampled[b, idx].item()
+                    else:
+                        token = torch.argmax(probs[b, idx]).item()
+                    generated[b, idx] = token
+                    # mark this position as filled
+                    is_filled[b, idx] = (token != pad_token_id)
+
+            # Update finished flags: only stop when EOS has been generated and all tokens before that EOS were already generated
+            if eos_token_id is not None:
+                for b in range(batch_size):
+                    if finished[b]:
+                        continue
+                    eos_pos = ((generated[b] == eos_token_id) & is_filled[b]).nonzero(as_tuple=False)
+                    if eos_pos.numel() == 0:
+                        continue
+                    p = int(eos_pos[0].item())
+                    if p == 0:
+                        finished[b] = True
+                    else:
+                        # check that all tokens before the first eos were already filled (provided or generated)
+                        if is_filled[b, :p].all():
+                            finished[b] = True
+                        
+
+        return generated
+
+    @classmethod
+    def from_llama_checkpoint(cls, pretrained_model_name_or_path: str, *args, **kwargs):
+        """
+        Convenience loader that initializes a `LlamaTwoStreamForCausalLM` from a standard
+        LLaMA checkpoint (e.g., `LlamaForCausalLM` or `LlamaModel`). This handles common
+        key name differences and ignores missing/unexpected keys where shapes mismatch.
+
+        Args:
+            pretrained_model_name_or_path (str): path or HF id of the pretrained LLaMA model.
+            *args, **kwargs: forwarded to `cls(config)` when constructing the model.
+
+        Returns:
+            LlamaTwoStreamForCausalLM: model with weights loaded where compatible.
+        """
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        # Load config
+        config = LlamaConfig.from_pretrained(pretrained_model_name_or_path)
+
+        # Instantiate empty two-stream model
+        model = cls(config, *args, **kwargs)
+
+        # Load source LLaMA model weights
+        try:
+            src = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path, low_cpu_mem_usage=True)
+        except Exception:
+            # Fallback to loading a raw state_dict if the HF convenience loader fails
+            import torch
+            src_state = torch.load(pretrained_model_name_or_path, map_location="cpu")
+            if isinstance(src_state, dict) and "model" in src_state:
+                src_state = src_state
+            else:
+                raise
+        else:
+            src_state = src.state_dict()
+
+        dst_state = model.state_dict()
+
+        # Try direct key copy when shape matches, otherwise try a small set of common renames
+        mapped = {}
+        for k, v in src_state.items():
+            if k in dst_state and v.shape == dst_state[k].shape:
+                mapped[k] = v
+                continue
+
+            # Common alternative keys to try
+            alternates = [
+                k.replace("model.decoder.", "model."),
+                k.replace("decoder.", "model."),
+                k.replace("base_model.model.", "model."),
+            ]
+            for k2 in alternates:
+                if k2 in dst_state and v.shape == dst_state[k2].shape:
+                    mapped[k2] = v
+                    break
+
+        # Load mapped weights (non-strict to allow missing/unexpected keys)
+        missing, unexpected = model.load_state_dict(mapped, strict=False)
+
+        # Log results
+        logger.info("Loaded %d parameters from source checkpoint", len(mapped))
+        if missing:
+            logger.info("Missing keys when loading two-stream model: %s", missing)
+        if unexpected:
+            logger.info("Unexpected keys when loading two-stream model: %s", unexpected)
+
+        return model
